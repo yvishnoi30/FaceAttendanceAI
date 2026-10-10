@@ -1,0 +1,124 @@
+
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import cv2
+import numpy as np
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    status,
+)
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from backend.app.core.config import settings
+from backend.app.database.session import get_db
+from backend.app.services.face_enrollment_service import (
+    enroll_student_face,
+)
+
+
+router = APIRouter(
+    prefix="/face-enrollment",
+    tags=["Face Enrollment"],
+)
+
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+
+@router.post(
+    "/{student_id}",
+    status_code=status.HTTP_201_CREATED,
+)
+def enroll_face(
+    student_id: UUID,
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    filename = Path(image.filename or "").name
+    extension = Path(filename).suffix.lower()
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a JPG, JPEG, or PNG image.",
+        )
+
+    content = image.file.read(MAX_FILE_SIZE + 1)
+
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded image is empty.",
+        )
+
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="Image must not exceed 10 MB.",
+        )
+
+    decoded_image = cv2.imdecode(
+        np.frombuffer(content, dtype=np.uint8),
+        cv2.IMREAD_COLOR,
+    )
+
+    if decoded_image is None:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is not a valid image.",
+        )
+
+    faces_dir = Path(settings.FACES_DIR).resolve()
+    faces_dir.mkdir(parents=True, exist_ok=True)
+
+    image_path = faces_dir / (
+        f"{student_id}_{uuid4().hex}{extension}"
+    )
+
+    try:
+        image_path.write_bytes(content)
+
+        result = enroll_student_face(
+            db=db,
+            student_id=student_id,
+            image_path=str(image_path),
+        )
+
+        return result
+
+    except FileNotFoundError as exc:
+        image_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+
+    except ValueError as exc:
+        image_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        image_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Database error during face enrollment.",
+        ) from exc
+
+    except Exception as exc:
+        image_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Face enrollment failed. Check the server logs.",
+        ) from exc
+
+    finally:
+        image.file.close()
